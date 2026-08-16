@@ -1,24 +1,101 @@
-import flet as ft
 import os
 import json
-import re
 import sys
 import subprocess
 from pathlib import Path
-
-import scrubadub
 import git
 from groq import Groq
 from pydantic import TypeAdapter
-
-
+import requests
+import re
 # ============================================================
 # CONFIGURATION
 # ============================================================
+CHAT_FILE = "chat_history_"
+def get_current_repo_slug_automatically():
+    """
+    Scans the local PyCharm project working directory, reads your local
+    Git origin tracking links, and automatically extracts the 'username/repo' handle.
+    """
+    try:
+        # 1. Run a native terminal check to pull down the tracking URL string
+        # This works dynamically on any machine with Git installed
+        origin_url = subprocess.check_output(
+            ["git", "config", "--get", "remote.origin.url"],
+            text=True
+        ).strip()
 
-CHAT_FILE = "chat_history.json"
+        print(f"🔍 Local Git configuration detected remote link: {origin_url}")
 
-client = Groq(api_key="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")
+        # 2. Extract out the slug handles matching both HTTPS and SSH variants
+        # e.g., 'https://github.com' -> 'Faraz306/yf_ai_plugin'
+        # e.g., 'git@github.com:Faraz306/yf_ai_plugin.git'    -> 'Faraz306/yf_ai_plugin'
+        match = re.search(r"github\.com[:/]([^/]+/[^.]+)", origin_url)
+
+        if match:
+            slug = match.group(1)
+            # Remove trailing '.git' modifications if they exist in configuration files
+            if slug.endswith(".git"):
+                slug = slug[:-4]
+            return slug
+
+    except Exception as e:
+        print(f"⚠️ Git configuration read loop skipped: {e}")
+
+    # Fallback to a plain tracking parameter string if the project folder lacks a Git history init
+    return None
+
+
+def dispatch_async_cloud_job(task_prompt, current_user_id):
+    github_token = os.getenv("GITHUB_TOKEN")
+    repo_slug = get_current_repo_slug_automatically()
+
+    if not repo_slug:
+        print("❌ Critical Failure: Could not automatically detect a valid GitHub remote origin in this project!")
+        return False
+
+    if not github_token:
+        print("❌ Critical Failure: GITHUB_TOKEN is not set in the environment.")
+        return False
+
+    print(f"🚀 Targeted Orchestration Target Resolved: {repo_slug}")
+    dispatch_url = f"https://api.github.com/repos/{repo_slug}/dispatches"
+
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "User-Agent": "Faraz306",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
+    payload = {
+        "event_type": "yf_remote_agent_task",
+        "client_payload": {
+            "task": task_prompt,
+            "user_id": current_user_id
+        }
+    }
+
+    try:
+        res = requests.post(dispatch_url, headers=headers, json=payload, timeout=15)
+    except Exception as e:
+        print(f"❌ Network/Error sending dispatch: {e}")
+        return False
+
+    # Success for repository_dispatch returns 204 No Content
+    if res.status_code == 204:
+        print("✅ Cloud dispatch accepted (204 No Content).")
+        return True
+
+    # Otherwise print server response and return False
+    print(f"❌ GitHub API Error Status Code: {res.status_code}")
+    print(f"📝 GitHub Server Error Response Body: {res.text}")
+    print(f"🔑 Debug - Token loaded: {'Yes (starts with ' + github_token[:8] + '...)' if github_token else 'No (None/Empty)'}")
+    print(f"📦 Debug - Payload structure: {json.dumps(payload, indent=2)}")
+    return False
+
+client = Groq(api_key="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")
 
 StringSchema = TypeAdapter(str)
 
@@ -27,13 +104,13 @@ StringSchema = TypeAdapter(str)
 # CHAT HISTORY
 # ============================================================
 
-def load_chat_history():
-    if not os.path.exists(CHAT_FILE):
+def load_chat_history(user_id):
+    if not os.path.exists(f"{CHAT_FILE}{user_id}"):
         return []
 
     try:
         with open(
-            CHAT_FILE,
+            f"{CHAT_FILE}{user_id}",
             "r",
             encoding="utf-8"
         ) as file:
@@ -43,19 +120,15 @@ def load_chat_history():
         return []
 
 
-def save_chat_history(history):
-    with open(
-        CHAT_FILE,
-        "w",
-        encoding="utf-8"
-    ) as file:
-
-        json.dump(
-            history,
-            file,
-            indent=4,
-            ensure_ascii=False
-        )
+def save_chat_history(history, user_id):
+    with open(f"{CHAT_FILE}{user_id}", "w", encoding="utf-8") as file:
+        file.write(history)
+    json.dump(
+        history,
+        file,
+        indent=4,
+        ensure_ascii=False
+    )
 
 
 def read_history():
@@ -402,9 +475,7 @@ FORBIDDEN_COMMANDS = [
 ]
 
 
-def ask_for_command_and_execute_command(
-    command: str
-):
+def ask_for_command_and_execute_command(command: str):
 
     if not command:
         return "Error: command is empty."
@@ -429,51 +500,48 @@ def ask_for_command_and_execute_command(
             cwd=WORKSPACE_ROOT,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=30,
         )
 
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
 
+        # 🚀 YF AI TOKEN SHIELD: Slices oversized outputs to protect the 6,000 TPM limit
+        if len(stdout) > 500:
+            stdout = (
+                stdout[:500]
+                + "\n... [TRUNCATED BY YF AI TO PROTECT CONTEXT BOUNDARIES]"
+            )
+
+        if len(stderr) > 500:
+            stderr = (
+                stderr[:500]
+                + "\n... [TRUNCATED BY YF AI TO PROTECT CONTEXT BOUNDARIES]"
+            )
+
         output_parts = []
 
         if stdout:
-            output_parts.append(
-                "STDOUT:\n" + stdout
-            )
+            output_parts.append("STDOUT:\n" + stdout)
 
         if stderr:
-            output_parts.append(
-                "STDERR:\n" + stderr
-            )
+            output_parts.append("STDERR:\n" + stderr)
 
         if not output_parts:
 
-            output_parts.append(
-                "Command completed with no output."
-            )
+            output_parts.append("Command completed with no output.")
 
-        output_parts.append(
-            f"Exit code: {result.returncode}"
-        )
+        output_parts.append(f"Exit code: {result.returncode}")
 
-        return "\n\n".join(
-            output_parts
-        )
+        return "\n\n".join(output_parts)
 
     except subprocess.TimeoutExpired:
 
-        return (
-            "Command timed out after "
-            "30 seconds."
-        )
+        return "Command timed out after " "30 seconds."
 
     except Exception as error:
 
-        return (
-            f"Execution error: {error}"
-        )
-
+        return f"Execution error: {error}"
 
 # ============================================================
 # GIT
@@ -636,67 +704,61 @@ def git_commit_and_push(
 # ============================================================
 # SANITIZATION
 # ============================================================
-
-SECRET_PATTERN = re.compile(
-    r"(?:"
-    r"[a-zA-Z0-9_-]{24,}\.[a-zA-Z0-9_-]{6,}\."
-    r"[a-zA-Z0-9_-]{27,}"
-    r"|(?:sk|key|ghp|passwd|pwd|secret|token|aws)"
-    r"[-_a-zA-Z0-9]{12,64}"
-    r"|[a-zA-Z0-9+/=]{32,128}"
-    r")"
-)
+import math
+import scrubadub
 
 
-def clean_input_pipeline(
-    raw_user_input
-):
+def calculate_entropy(text: str) -> float:
+    """Calculates Shannon Entropy to catch truly random keys without regex."""
+    if not text:
+        return 0.0
+    frequencies = {}
 
-    if not raw_user_input:
+    for char in text:
+
+        frequencies[char] = frequencies.get(char, 0) + 1
+    entropy = 0.0
+    total_len = len(text)
+    for count in frequencies.values():
+        p = count / total_len
+        entropy -= p * math.log2(p)
+    return entropy
+
+
+def clean_input_pipeline(raw_user_input: str) -> str:
+    if not raw_user_input or not raw_user_input.strip():
         return ""
 
-    if not raw_user_input.strip():
-        return ""
+    # Safe lists to bypass tracking (Covers your 8501, 1024, version tokens)
+    # Since we use entropy/length, normal numbers and short ports are naturally ignored!
+    safe_keywords = {"python", "amd64", "version", "port"}
 
-    # Do NOT aggressively redact normal numbers.
-    #
-    # Coding requests frequently contain:
-    #
-    # 1024
-    # 5000
-    # port 8501
-    # Python versions
-    # dimensions
-    # API parameters
-    #
-    # Redacting them makes coding instructions unreliable.
+    # 1. Non-regex Secret Scanning via Content Splitting & Entropy Analysis
+    # Splits by common characters found in code variables or strings
+    words = [w.strip('"\'=:,;()[]{}') for w in raw_user_input.split()]
+    found_secrets = set()
 
-    found_secrets = SECRET_PATTERN.findall(
-        raw_user_input
-    )
+    for word in words:
+        # High-entropy thresholds (>=4.3) cleanly pick up real API keys,
+        # JWT tokens, and hashes while ignoring standard words or standard integers.
+        if len(word) >= 20 and word.lower() not in safe_keywords:
+            # Confirm it's a mixed string (has letters AND numbers/symbols) to prevent clearing huge flat text blocks
+            if any(c.isdigit() or c in "+/=-_" for c in word) and any(c.isalpha() for c in word):
+                if calculate_entropy(word) > 4.2:
+                    found_secrets.add(word)
 
-    for secret in set(found_secrets):
+    # Redact identified entropy structures
+    for secret in found_secrets:
+        raw_user_input = raw_user_input.replace(secret, "[REDACTED_SECRET]")
 
-        raw_user_input = raw_user_input.replace(
-            secret,
-            "[REDACTED_SECRET]"
-        )
-
+    # 2. PII Cleanup Pipeline (Names, Emails, IP Addresses) via scrubadub
     scrubber = scrubadub.Scrubber()
-
     try:
-
-        cleaned = scrubber.clean(
-            raw_user_input
-        )
-
+        cleaned = scrubber.clean(raw_user_input)
     except Exception:
-
         cleaned = raw_user_input
 
-    return StringSchema.validate_python(
-        cleaned
-    )
+    return StringSchema.validate_python(cleaned)
 
 
 # ============================================================
@@ -1223,7 +1285,9 @@ def execute_tool(tool_call):
 
 def final_ai_agent(
     user_input,
-    model="openai/gpt-oss-120b"
+    model="llama-3.1-8b-instant",
+    user_id="guest"  # 1. ADD USER_ID AS A PARAMETER
+
 ):
     """
     Autonomous Groq workspace coding agent.
@@ -1261,17 +1325,21 @@ def final_ai_agent(
         return (
             "AI: Please provide a request."
         )
+    import os
+    HISTORY = read_history()
 
     # ========================================================
     # 2. SYSTEM PROMPT
     # ========================================================
+    USER_WORKSPACE_ROOT = os.path.join(WORKSPACE_ROOT, f"workspace_{user_id}")
 
     system_prompt = f"""
 You are an autonomous private workspace coding agent.
 
 WORKSPACE:
-{WORKSPACE_ROOT}
-
+{USER_WORKSPACE_ROOT}
+USER_HISTORY:
+{HISTORY}
 AVAILABLE TOOLS:
 create_file
 edit_file
@@ -1292,7 +1360,7 @@ When the user asks you to create, edit, read, delete,
 validate, install, execute, commit, or push something,
 actually use the appropriate tool.
 
-Do NOT merely describe what you would do.
+merely describe what you would do.
 
 ------------------------------------------------------------
 
@@ -1520,7 +1588,7 @@ CURRENT WORKSPACE
 
                 temperature=0,
 
-                max_completion_tokens=8000
+                max_completion_tokens=2000
             )
 
             # ------------------------------------------------
@@ -1629,10 +1697,39 @@ CURRENT WORKSPACE
                     result = execute_tool(
                         tool_call
                     )
+                    if function_name in ["create_file", "edit_file"]:
 
-                # ---------------------------------------------
-                # Record local execution report
-                # ---------------------------------------------
+                        # Extract arguments safely from the tool call
+                        import json
+                        import ast
+                        import os
+
+                        try:
+                            args = json.loads(tool_call.function.arguments)
+                            # Grab file details from args (fallback to generic if missing)
+                            file_code = args.get("code") or args.get("content", "")
+                            file_name = args.get("file_name") or args.get("file_path", "app.py")
+
+                            # Only parse if it's meant to be a Python script
+                            if file_name.endswith(".py") and file_code:
+                                try:
+                                    # AST parses code strings instantly without running them
+                                    ast.parse(file_code)
+                                except SyntaxError as syntax_err:
+                                    # Intercept the success message! Force Groq to see the bug.
+                                    result = (
+                                        f"CRITICAL ERROR: Code saved in '{file_name}' contains a syntax error!\n"
+                                        f"Line {syntax_err.lineno}: {syntax_err.msg}\n"
+                                        f"Code snippet with issue:\n{syntax_err.text}\n"
+                                        "CRITICAL RULE: You MUST call 'edit_file' immediately to fix this error!"
+                                    )
+                        except Exception:
+                            # Safely ignore parsing issues if JSON or arguments are weird
+                            pass
+
+                        # ---------------------------------------------
+                        # Record local execution report
+                        # ---------------------------------------------
 
                 execution_results.append(
                     f"ROUND: {round_number}\n"
@@ -1700,51 +1797,104 @@ CURRENT WORKSPACE
                 else "No tools were executed."
             )
         )
-
+import flet as ft
 def main(page: ft.Page):
     import flet as ft
+    import os
+    import json
+
     page.theme_mode = ft.ThemeMode.DARK
     page.title = "YF AI Private Code Writer"
-    page.bgcolor = "black"
+    page.bgcolor = "#0B0C10"  # Sleek dark gray palette instead of raw black
 
-    # Title label header reference
     title = ft.Text(
-        "YF AI SECURE CODE WRITER",
-        size=15,
-        color="amber",
+        "Yamaan Faraz YF AI™",
+        size=11,
+        weight=ft.FontWeight.BOLD,
+        color="#6C7A89"
     )
 
-    # Core layout viewport scroll engine
     chat_history = ft.ListView(
         expand=True,
         spacing=10,
         auto_scroll=True,
     )
 
-    # Initialize chat history stream arrays securely
-    history = []
-    try:
-        history = load_chat_history()
-    except NameError:
-        # Fallback local container setup if load utility is absent
-        pass
+    # Hardcoded to "guest" to match your send_click function exactly
+    current_user_id = page.session.id
 
-    for message in history:
-        chat_history.controls.append(
-            ft.Text(message.get("text", ""), color="white")
-        )
+    filename = f"{CHAT_FILE}{current_user_id}"
+    user_session_history = []
 
-    # Declare references early to ensure python namespace tracking handles hooks safely
+    # =========================================================================
+    # 1. VISUAL HISTORY RELOADER ENGINE (Ensures it looks gorgeous on boot!)
+    # =========================================================================
+    if os.path.exists(filename):
+        try:
+            with open(filename, "r", encoding="utf-8") as file:
+                user_session_history = json.load(file)
+
+            for message in user_session_history:
+                raw_text = message.get("text", "")
+
+                if raw_text.startswith("You:"):
+                    # Clean out the prefix string for the UI display
+                    clean_content = raw_text.replace("You:", "").strip()
+                    chat_history.controls.append(
+                        ft.Column([
+                            ft.Row([
+                                ft.Icon(ft.Icons.PERSON, color=ft.Colors.BLUE_400, size=16),
+                                ft.Text("You", color=ft.Colors.BLUE_200, weight=ft.FontWeight.W_600, size=13),
+                            ], spacing=8),
+                            ft.Row([
+                                ft.VerticalDivider(width=24, color=ft.Colors.TRANSPARENT),
+                                ft.Markdown(
+                                    value=clean_content,
+                                    selectable=True,
+                                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                                    code_theme=ft.MarkdownCodeTheme.ATOM_ONE_DARK,
+                                ),
+                            ]),
+                        ], spacing=4)
+                    )
+                elif raw_text.startswith("YF AI:"):
+                    clean_content = raw_text.replace("YF AI:", "").strip()
+                    chat_history.controls.append(
+                        ft.Column([
+                            ft.Row([
+                                ft.Icon(ft.Icons.SUPPORT_AGENT, color=ft.Colors.PURPLE_400, size=16),
+                                ft.Text("YF AI", color=ft.Colors.PURPLE_200, weight=ft.FontWeight.W_600, size=13),
+                            ], spacing=8),
+                            ft.Row([
+                                ft.VerticalDivider(width=24, color=ft.Colors.TRANSPARENT),
+                                ft.Markdown(
+                                    value=clean_content,
+                                    selectable=True,
+                                    extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                                    code_theme=ft.MarkdownCodeTheme.ATOM_ONE_DARK,
+                                ),
+                            ]),
+                        ], spacing=4)
+                    )
+                # Append divider rules between loaded historical components
+                chat_history.controls.append(ft.Divider(height=20, color=ft.Colors.GREY_800))
+        except Exception as e:
+            print(f"Error loading chat backup: {e}")
+            user_session_history = []
+
     user_input = None
+    send_btn = None
+
 
     # =========================================================================
     # 2. INTERACTIVE USER INPUT ANIMATION ENGINE
     # =========================================================================
     def handle_input_change(e):
-        if user_input:
+        nonlocal user_input, send_btn
+        if user_input and send_btn:
             has_text = bool(user_input.value.strip())
-            # Changes color dynamically to whatever theme is active in settings
-            send_btn.bgcolor = color_dropdown.value if has_text else "grey800"
+            btn_color = color_dropdown.value if ('color_dropdown' in locals() or 'color_dropdown' in globals()) and color_dropdown.value else "blue"
+            send_btn.bgcolor = btn_color if has_text else "grey800"
             send_btn.opacity = 1.0 if has_text else 0.3
             send_btn.disabled = not has_text
             send_btn.update()
@@ -1753,67 +1903,133 @@ def main(page: ft.Page):
     # 3. INTERACTIVE CHAT ENGINE WITH DUAL OVERRIDE VALUES
     # =========================================================================
     def send_click(e):
+        nonlocal user_input, send_btn
+        if not user_input or not user_input.value:
+            return
+
         text_payload = user_input.value.strip()
-        if text_payload:
-            user_display = f"You: {text_payload}"
-            chat_history.controls.append(ft.Text(user_display, color="white"))
-            history.append({"text": user_display})
-            try: save_chat_history(history)
-            except NameError: pass
+        if not text_payload:
+            return
 
-            # Extract selected layout parameters to parse downstream strings
-            chosen_model_string = model_dropdown.value
-
-            user_input.value = ""
-            handle_input_change(None) # Instantly dims button back to grey on text wipe
-            page.update()
-
+        # Reload history to keep array states in sync before modifying
+        if os.path.exists(filename):
             try:
-                text_payload = clean_input_pipeline(text_payload)
-                # CRUCIAL ROUTER: Passes exactly the two arguments you specified
-                text = final_ai_agent(text_payload, model=chosen_model_string)
-            except NameError:
-                # Local mock fallback execution handling for independent standalone executions
-                text = f"[Local Agent Mock Mode] Running execution sequence via: {chosen_model_string}\nProcessed Code Payload successfully."
+                with open(filename, "r", encoding="utf-8") as file:
+                    current_history = json.load(file)
+            except Exception:
+                current_history = []
+        else:
+            current_history = []
 
-            ai_display_string = f"YF AI:\n{text}"
-            chat_history.controls.append(ft.Text(ai_display_string, color="white"))
-            history.append({"text": ai_display_string})
-            try: save_chat_history(history)
-            except NameError: pass
-            page.update()
+        # 1. RENDER USER MESSAGE
+        chat_history.controls.append(
+            ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.PERSON, color=ft.Colors.BLUE_400, size=16),
+                    ft.Text("You", color=ft.Colors.BLUE_200, weight=ft.FontWeight.W_600, size=13),
+                ], spacing=8),
+                ft.Row([
+                    ft.VerticalDivider(width=24, color=ft.Colors.TRANSPARENT),
+                    ft.Markdown(
+                        value=text_payload, # <-- FIXED: Was throwing variable crash 'text' error here
+                        selectable=True,
+                        extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                        code_theme=ft.MarkdownCodeTheme.ATOM_ONE_DARK,
+                    ),
+                ]),
+            ], spacing=4)
+        )
+
+        current_history.append({"text": f"You: {text_payload}"})
+
+        choosen_model = model_dropdown.value
+        user_input.value = ""
+        handle_input_change(None)
+        page.update()
+
+        try:
+            cleaned_payload = clean_input_pipeline(text_payload)
+            text = final_ai_agent(cleaned_payload, model=choosen_model, user_id=current_user_id)
+            cloud_job_dispatched = dispatch_async_cloud_job(cleaned_payload, current_user_id)
+            if not cloud_job_dispatched:
+                print("failed to execute in cloud")
+        except Exception as ex:
+            text = f"An error occurred: {ex}"
+
+        chat_history.controls.append(ft.Divider(height=10, color=ft.Colors.TRANSPARENT))
+
+        # 2. RENDER AI RESPONSE
+        chat_history.controls.append(
+            ft.Column([
+                ft.Row([
+                    ft.Icon(ft.Icons.SUPPORT_AGENT, color=ft.Colors.PURPLE_400, size=16),
+                    ft.Text("YF AI", color=ft.Colors.PURPLE_200, weight=ft.FontWeight.W_600, size=13),
+                ], spacing=8),
+                ft.Row([
+                    ft.VerticalDivider(width=24, color=ft.Colors.TRANSPARENT),
+                    ft.Markdown(
+                        value=text,
+                        selectable=True,
+                        extension_set=ft.MarkdownExtensionSet.GITHUB_WEB,
+                        code_theme=ft.MarkdownCodeTheme.ATOM_ONE_DARK,
+                    ),
+                ]),
+            ], spacing=4)
+        )
+
+        chat_history.controls.append(ft.Divider(height=20, color=ft.Colors.GREY_800))
+
+        ai_display = f"YF AI: {text}"
+        current_history.append({"text": ai_display})
+
+        # Save back safely to disk
+        try:
+            with open(filename, "w", encoding="utf-8") as file:
+                json.dump(current_history, file, ensure_ascii=False, indent=4)
+        except Exception as write_err:
+            print(f"err: {write_err}")
+
+        page.update()
 
     # =========================================================================
     # 4. CAPSULE LAYOUT COMPONENT CONSTRUCTORS
     # =========================================================================
-    send_btn = ft.ElevatedButton(
-        content=ft.Icon(
-            ft.Icons.ARROW_UPWARD,
-            color="yellow",
-            size=18
-        ),
-        bgcolor="blue",
-        opacity=1.0,
+    send_btn = ft.IconButton(
+        icon=ft.Icons.ARROW_UPWARD,
+        icon_color="#0F0F11",  # Dark dark icon text creates stark premium contrast against gold
+        bgcolor="#FFC107",  # Electric neon splash accent color
         disabled=True,
-        on_click=send_click,
+        opacity=0.4,
+        width=44,
+        height=44,
+        on_click=send_click
     )
 
     user_input = ft.TextField(
-        hint_text="Ask the agent to write code (e.g. 'Create a script inside src/utils.py')...",
+        hint_text="Ask YF AI to do anything...",
+        hint_style=ft.TextStyle(color="#3A3F47", size=13),
+        text_style=ft.TextStyle(color=ft.Colors.WHITE, size=14),
         expand=True,
-        bgcolor="black",
-        border_color="white",
-        focused_border_color="white",
-        text_style=ft.TextStyle(color="white"),
-        on_change=handle_input_change,
+        multiline=True,
+        max_lines=3,
+        shift_enter=True,
+        border_radius=30,
+        border_color="#1F242E",
+        focused_border_color="#4CC9F0",
+        bgcolor="#141722",
+        content_padding=ft.Padding(left=20, top=14, right=20, bottom=14),
+
+        # FIX: Put this line back so the app watches your typing instantly!
+        on_change=handle_input_change
     )
 
     input_row = ft.Row(
         controls=[
             user_input,
-            send_btn,
+            send_btn
         ],
         vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        spacing=12,  # Space between the capsule input and the action button
     )
 
     app_content = ft.Column(
@@ -1825,28 +2041,15 @@ def main(page: ft.Page):
         expand=True,
     )
 
-    logo_image = ft.Image(
-        src="/company.png",
-        width=40,
-            height=40,
-            fit=ft.BoxFit.CONTAIN,
-            top=5,
-            left=5,
-        )
-
         # =========================================================================
         # 5. MODULAR CONTROL DASHBOARD & SETTINGS OVERLAYS
         # =========================================================================
 
     def change_accent_color(e):
-        # Fetch the lowercase color value (e.g., "amber", "blue")
         selected_color = color_dropdown.value.lower()
-
-        # Apply the accent color seed to the app theme
         page.theme = ft.Theme(color_scheme_seed=selected_color)
         page.update()
 
-    # 1. Create the dropdown with ZERO events inside it to prevent errors
     color_dropdown = ft.Dropdown(
         label="App Accent Theme Color",
         value="amber",
@@ -1856,85 +2059,101 @@ def main(page: ft.Page):
             ft.dropdown.Option("green", "Hacker Green"),
             ft.dropdown.Option("purple", "Cyber Neon Purple"),
         ],
+        # Modern UI Styles (Capsule borders & deep inputs)
+        border_radius=12,
+        border_color="#222831",
+        focused_border_color="#FFC107",
+        bgcolor="#141722",
     )
-
-    # 2. Bind the event directly on its own line (Bypasses __init__ keyword validation)
     color_dropdown.on_change = change_accent_color
 
-    # Feature 2: Core Consolidated Multi-Model Dropdown Option Matrix
+    # =========================================================================
+    # MODERN MULTI-MODEL CONFIGURATION MATRIX
+    # =========================================================================
     model_dropdown = ft.Dropdown(
         label="Target Language Model",
-        value="llama-3.3-70b-versatile", # Default safe state engine assignment
-    options=[
-        ft.dropdown.Option("openai/gpt-4o", "GPT-4o (OpenAI Omni)"),
-        ft.dropdown.Option("openai/gpt-4o-mini", "GPT-4o-Mini (OpenAI Mini)"),
-        ft.dropdown.Option("qwen/qwen-coder-32b", "Qwen 2.5 Coder (Alibaba Code)"),
-        ft.dropdown.Option("deepseek/deepseek-coder", "DeepSeek-Coder-V2 (Math & Code)"),
-        ft.dropdown.Option("openai/gpt-oss-120b", "GPT-OSS-120B (OpenAI OSS)"),
-        ft.dropdown.Option("openai/gpt-oss-20b", "GPT-OSS-20B (OpenAI OSS)")])
+        value="openai/gpt-oss-120b",  # Ensured the initial value explicitly matches an available option
+        options=[
+            ft.dropdown.Option("openai/gpt-oss-120b", "GPT-OSS 120B (OpenAI)"),
+            ft.dropdown.Option("openai/gpt-oss-20b", "GPT-OSS 20B (OpenAI)"),
+            ft.dropdown.Option("minimaxai/minimax-m2.7", "MiniMax M2.7"),
+        ],
+        border_radius=12,
+        border_color="#222831",
+        focused_border_color="#FFC107",
+        bgcolor="#141722",
+    )
 
-    # Feature 3: Clear Chat Cache Storage Routine
+    # =========================================================================
+    # FIXED & MODERNIZED CACHE PURGE SYSTEM
+    # =========================================================================
     def wipe_chat_cache(e):
-        delete_file("chat_history.json")
-    clear_history_btn = ft.ElevatedButton(
+        # FIX: Changed '.set' to '.get' to prevent the multi-user crash.
+        # It also cross-checks your session string format exactly!
+        current_user_id = page.session.get("session_user_id") or "guest"
+        target_path = f"chat_history_{current_user_id}.json"
+
+        import os
+        if os.path.exists(target_path):
+            os.remove(target_path)
+
+        # Clean the frontend visual view list immediately
+        chat_history.controls.clear()
+        settings_dialog.open = False
+        page.update()
+
+    # Modernized flat interactive layout actions
+    clear_history_btn = ft.TextButton(
         "Wipe Chat Cache Context",
         icon=ft.Icons.DELETE_FOREVER,
-        color="white",
-        bgcolor="red800",
+        icon_color=ft.Colors.RED_400,
+        style=ft.ButtonStyle(
+            color=ft.Colors.RED_200,
+            padding=ft.Padding(left=16, top=12, right=16, bottom=12),
+            overlay_color=ft.Colors.with_opacity(0.1, ft.Colors.RED_900)
+        ),
         on_click=wipe_chat_cache
     )
 
-    # Setup the Material Alert Dialog layout container
-    settings_dialog = ft.AlertDialog(
-        title=ft.Text("YF AI Control Dashboard", size=20, weight=ft.FontWeight.BOLD),
-        content=ft.Column(
-            controls=[
-                ft.Text("Manage dashboard themes, assign core model target string paths, and purge session logs safely.", size=12, color="grey400"),
-                ft.Divider(height=10, color="transparent"),
-                color_dropdown,
-                ft.Divider(height=5, color="grey800"),
-                ft.Text("Model Configuration Layer", size=14, weight=ft.FontWeight.W_500),
-                model_dropdown,
-                ft.Divider(height=5, color="grey800"),
-                ft.Text("System Memory Actions", size=14, weight=ft.FontWeight.W_500),
-                clear_history_btn
-            ],
-            tight=True,
-            spacing=15
-        ),
-        actions=[
-            ft.TextButton("Close Settings", on_click=lambda e: setattr(settings_dialog, "open", False) or page.update())
-        ],
-        actions_alignment=ft.MainAxisAlignment.END,
-    )
+    # =========================================================================
+    # PREMIUM DIALOG SHEET CONTAINER
+    # =========================================================================
+    settings_dialog = ft.Column([
+    # Page Header matching your ultra-modern style
+    ft.Row([
+        ft.Text("SYSTEM PARAMETERS", size=30, weight=ft.FontWeight.BOLD, color="#CA")
+    ], alignment=ft.MainAxisAlignment.CENTER),
+    ft.Divider(height=1, color="#1F232C"),
 
-    # Store settings dialog inside page overlays configuration matrix safely
-    page.overlay.append(settings_dialog)
+    # Description
+    ft.Text(
+        "Manage dashboard themes, assign core model target string paths, and purge session logs safely.",
+        size=13, color="#6C7A89"
+    ),
+    ft.Divider(height=10, color="transparent"),
 
-    # Open Settings Modal Event Action Routine
-    def open_settings(e):
-        settings_dialog.open = True
-        page.update()
+    # UI Appearance Section
+    ft.Text("UI Appearance & Theme", size=13, weight=ft.FontWeight.W_600, color="#A7A9BE"),
+    color_dropdown,  # Your existing dropdown
 
-    # Float a gears settings tracking icon safely over the top right canvas corner grid
-    settings_btn = ft.ElevatedButton(
-        content=ft.Icon(ft.Icons.SETTINGS, color="white", size=22),
-        top=10,
-        right=10,
-        on_click=open_settings,
-    )
-    import io
+    ft.Divider(height=10, color="#1F232C"),
 
-    import base64
+    # Model Configuration Section
+    ft.Text("Model Configuration Layer", size=13, weight=ft.FontWeight.W_600, color="#A7A9BE"),
+    model_dropdown,  # Your existing dropdown
 
-    import os
+    ft.Divider(height=10, color="#1F232C"),
 
-    from pathlib import Path
-    import flet as ft
-    import flet_video as ftv
-    import torch
-    from diffusers import StableDiffusionXLPipeline
+    # Memory Actions Section
+    ft.Text("System Memory Actions", size=13, weight=ft.FontWeight.W_600, color="#A7A9BE"),
+    ft.Row([clear_history_btn], alignment=ft.MainAxisAlignment.START)
+    ], expand=True, visible=False, spacing=12)
 
+
+    # =========================================================================
+    # THE REPLACEMENT SIDEBAR CONTROLLERS (Container Free)
+    # =========================================================================
+    # This button now anchors smoothly down on the left navigation drawer rail:
     # 1. Global storage and pipeline memory allocation variables
     image_history = []
     current_image_index = -1
@@ -1942,13 +2161,15 @@ def main(page: ft.Page):
 
     # Text Input Field with fixed dimensions so Flet cannot crush it
     image_prompt_input = ft.TextField(
-        hint_text="Describe the image you want to create...",
-        width=500,
-        height=50,
-        bgcolor="black",
-        border_color="white",
-        focused_border_color="white",
-        text_style=ft.TextStyle(color="white")
+        hint_text="Describe the image you want to synthesize in the cloud...",
+        hint_style=ft.TextStyle(color="#3A3F47", size=13),
+        text_style=ft.TextStyle(color=ft.Colors.WHITE, size=14),
+        expand=True,
+        border_radius=30,
+        border_color="#1F242E",
+        focused_border_color="#FFC107",
+        bgcolor="#141722",
+        content_padding=ft.Padding(left=20, top=14, right=20, bottom=14),
     )
 
     # Main visual display widget with a stable local file placeholder setup
@@ -1956,9 +2177,19 @@ def main(page: ft.Page):
         src="https://placehold.co",
         width=400,
         height=400,
-        fit="contain",
+        fit=ft.BoxFit.CONTAIN
+,
         visible=True
     )
+    header_row = ft.Row([ft.Text("YF AI", size=11, weight=ft.FontWeight.BOLD, color="#6C7A89")], alignment=ft.MainAxisAlignment.CENTER)
+
+    # Define the Chat Pane layout column
+    chat_pane = ft.Column([
+        header_row,
+        ft.Divider(height=1, color="#1F232C"),
+        chat_history,
+        input_row
+    ], expand=True, spacing=16, visible=True) # Visible by default on launch
 
     # Local layout loader wheel
     loading_indicator = ft.ProgressRing(visible=False, color="blueaccent")
@@ -1972,409 +2203,135 @@ def main(page: ft.Page):
         spacing=10,
         run_spacing=10,
     )
+    import requests
+    import time
+    import flet_video as ftv
 
     # 2. LOCAL PIPELINE IMAGE GENERATION FUNCTION
     def run_image_generation(e):
-        global image_history, current_image_index
-
-        local_image_pipe = None
-
-        from diffusers import StableDiffusionXLPipeline
-
+        if not image_prompt_input.value.strip(): return
+        submit_gen_btn.disabled = True
         loading_indicator.visible = True
-
         page.update()
-
         try:
-            prompt_text = image_prompt_input.value
-            if not prompt_text:
-                image_prompt_input.hint_text = "⚠️ Prompt cannot be empty!"
-                page.update()
-                return
-
-            # Check your local processing environment (CUDA GPU vs local CPU cycles)
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-            # Lazy-load the pipeline only once to prevent RAM lockups
-            if local_image_pipe is None:
-                print(f"⏳ Downloading/Loading local SDXL pipeline into {device.upper()} compute memory...")
-                model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-
-                local_image_pipe = StableDiffusionXLPipeline.from_pretrained(
-                    model_id,
-                    torch_dtype=torch.float32 if device == "cpu" else torch.float16,
-                    variant="fp16" if device == "cuda" else None,
-                    use_safetensors=True
-                )
-                local_image_pipe.to(device)
-
-            print(f"🎨 Computing local weights matrix vectors for prompt: '{prompt_text}'")
-            # num_inference_steps=20 ensures rapid computing loops on laptops
-            result = local_image_pipe(prompt=prompt_text, num_inference_steps=20)
-            image = result.images[0]
-
-            img_byte_arr = io.BytesIO()
-            image.save(img_byte_arr, format='PNG')
-            img_bytes = img_byte_arr.getvalue()
-
-            generated_b64_string = base64.b64encode(img_bytes).decode('utf-8')
-
-            # Append transaction node metrics to history tracker
-            new_image_data = {
-                "b64_string": generated_b64_string,
-                "prompt": prompt_text
-            }
-            image_history.append(new_image_data)
-            current_image_index = len(image_history) - 1
-
-            # Render straight onto your viewport layout screen
-            ai_image_display.src = f"data:image/png;base64,{generated_b64_string}"
-            ai_image_display.visible = True
-
-            # Clean update grid call
-            update_history_ui()
-
-        except Exception as error:
-            image_prompt_input.hint_text = f"❌ Local Pipe Error: {repr(error)}"
-            print(f"Image run error context trace: {repr(error)}")
-
+            res = requests.post("https://huggingface.co", headers={"Authorization": "Bearer hf_TOKEN"},
+                                json={"inputs": image_prompt_input.value.strip()})
+            if res.status_code == 200:
+                path = f"ai_image_{int(time.time())}.jpg"
+                with open(path, "wb") as f: f.write(res.content)
+                ai_image_display.src = path
+                history_grid.controls.append(ft.Image(src=path, fit=ft.ImageFit.COVER, border_radius=8))
+        except:
+            pass
         finally:
-            loading_indicator.visible = False
-            page.update()
+            submit_gen_btn.disabled = False; loading_indicator.visible = False; page.update()
 
-    def update_history_ui():
-        """Clears and rebuilds the history thumbnail grid (CONTAINER FREE)."""
-        history_grid.controls.clear()
+    image_prompt_input = ft.TextField(hint_text="Describe image...", expand=True, border_radius=30,
+                                      border_color="#1F242E", focused_border_color="#FFC107", bgcolor="#141722",
+                                      content_padding=ft.Padding(20, 14, 20, 14))
+    ai_image_display = ft.Image(src="https://placehold.co", width=400, height=400, fit=ft.BoxFit.CONTAIN
+)
+    history_grid = ft.GridView(height=120, runs_count=5, max_extent=120, spacing=10, run_spacing=10)
+    submit_gen_btn = ft.IconButton(ft.Icons.AUTO_AWESOME, icon_color="#0F0F11", bgcolor="#FFC107", width=44, height=44,
+                                   on_click=run_image_generation)
 
-        for index, img_data in enumerate(reversed(image_history)):
-            true_index = len(image_history) - 1 - index
+    image_pane = ft.Column([
+        ft.Row([ft.Text("IMAGE GENERATION", size=11, weight=ft.FontWeight.BOLD, color="#6C7A89")],
+               alignment=ft.MainAxisAlignment.CENTER),
+        ft.Divider(height=1, color="#1F232C"),
+        ft.Row([ai_image_display], alignment=ft.MainAxisAlignment.CENTER),
+        loading_indicator,
+        ft.Row([image_prompt_input, submit_gen_btn]),
+        history_grid
+    ], expand=True, visible=False, spacing=20)
 
-            # Maintained pure ft.Image mapping constraint rules
-            thumbnail = ft.GestureDetector(
-                content=ft.Image(
-                    src=f"data:image/png;base64,{img_data['b64_string']}",
-                    fit="cover",
-
-                    border_radius=8,
-                    width=100,
-                    height=100
-                ),
-                on_tap=lambda x, idx=true_index: load_historic_image(idx)
-            )
-            history_grid.controls.append(thumbnail)
-
-        history_grid.update()
-
-    def load_historic_image(index):
-
-        """Loads a previously generated image back into the main view."""
-
-        global current_image_index
-
-        current_image_index = index
-
-        img_data = image_history[index]
-
-        ai_image_display.src = f"data:image/png;base64,{img_data['b64_string']}"
-
-        image_prompt_input.value = img_data['prompt']
-
-        update_history_ui()
-
-        page.update()
-
-    def download_image(e):
-        global image_history, current_image_index
-
-        if current_image_index == -1 or not image_history:
-
-            image_prompt_input.hint_text = "❌ Error: No image selected!"
-
-            page.update()
-
-            return
-
-        try:
-            active_image = image_history[current_image_index]
-
-            downloads_path = Path.home() / "Downloads"
-
-            safe_prompt = "".join(x for x in active_image['prompt'][:15] if x.isalnum() or x in "._- ")
-
-            output_filepath = downloads_path / f"AI_{safe_prompt or 'image'}.png"
-
-            image_bytes = base64.b64decode(active_image['b64_string'])
-
-            with open(output_filepath, "wb") as file:
-
-                file.write(image_bytes)
-
-            image_prompt_input.hint_text = "✅ Saved active image to Downloads!"
-
-            page.update()
-
-        except Exception as error:
-
-            image_prompt_input.hint_text = f"❌ Failed to save: {error}"
-
-            page.update()
-
-    import os
-
-    import shutil
-
-    import flet as ft
-
-    import flet_video as ftv
-
-    import torch
-
-    from diffusers import DiffusionPipeline
-
-    # Global tracking variables mapping your local system file paths
-    video_link = ""
-
-    # FIXED: Replaced expand=True with width=500 to fix the disappearing layout bug
-    prompt = ft.TextField(
-        hint_text="Describe the video you want to create (e.g. 'A Cat walking...')...",
-        width=500,
-        bgcolor="black",
-        border_color="white",
-        focused_border_color="white",
-        text_style=ft.TextStyle(color="white")
-    )
-    local_video_pipe = None  # Holds the video model in memory to prevent slow reloads
-
+    # =========================================================================
+    # MINIMALIST VIDEO WORKSPACE
+    # =========================================================================
     def generate_ltx_video(e):
-        global video_link, local_video_pipe
-
-        # Guard check: Ensure prompt isn't blank
-        if not prompt.value:
-
-            prompt.error_text = "⚠️ Prompt cannot be empty!"
-
-            page.update()
-
-            return
-
-        # Freeze interactive controls and toggle the loading indicator ring on
+        global video_url
+        if not prompt.value.strip(): return
         submit_vid_btn.disabled = True
-
         loading_indicator.visible = True
-
-        prompt.error_text = ""
-
         page.update()
-
         try:
-            # Check local computer environment (NVIDIA GPU vs Local CPU)
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            headers = {"Authorization": "Key YOUR_KEY", "Content-Type": "application/json"}
+            req = requests.post("https://fal.run", headers=headers, json={"prompt": prompt.value.strip()}).json()
+            if "request_id" not in req: return
 
-            # Lazy-load the video pipeline only once into memory to save RAM
-            if local_video_pipe is None:
+            while True:
+                chk = requests.get(f"https://fal.run{req['request_id']}", headers=headers).json()
+                if "video" in chk: video_url = chk["video"]["url"]; break
+                if chk.get("status") == "FAILED": return
+                time.sleep(5)
 
-                print(f"⏳ Loading free local video generation pipeline onto {device.upper()}...")
-                # Using a tiny, fast model optimized to complete rapidly on laptop components
-                model_id = "jbilcke-hf/videos"
-
-                local_video_pipe = DiffusionPipeline.from_pretrained(
-                    model_id,
-                    torch_dtype=torch.float32 if device == "cpu" else torch.float16
-                )
-                local_video_pipe.to(device)
-
-            print(f"🎬 Local pipeline is computing video frames for prompt: '{prompt.value}'")
-            # num_inference_steps=15 keeps computing times fast on non-gaming laptops
-            video_frames = local_video_pipe(prompt.value, num_inference_steps=15).frames
-
-            if not os.path.exists("assets"):
-                os.makedirs("assets")
-
-            local_path = "assets/temp_ltx_output.mp4"
-
-            # Use your pipeline tool logic export wrapper to write the file directly to your disk
-            # (The local pipeline package automatically handles frame stitching seamlessly)
-            video_frames.save(local_path)
-
-            # Bind the file path variables back up to your global tracking variable
-            video_link = local_path
-
-            video_player.playlist = [ftv.VideoMedia(local_path)]
-
-            download_vid_btn.disabled = False
-
-            prompt.error_text = ""
-
-            print(f"✅ Success! Local video frames written safely to: {local_path}")
-
-        except Exception as ex:
-
-            prompt.error_text = f"❌ Local Video Pipe Error: {repr(ex)}"
-
-            print(f"Generation error hit: {repr(ex)}")
-
+            if video_url:
+                os.makedirs("downloads", exist_ok=True)
+                path = f"downloads/video_{req['request_id']}.mp4"
+                with open(path, "wb") as f: f.write(requests.get(video_url).content)
+                video_player.playlist = [ftv.VideoMedia(path)]
+                video_player.update()
+        except:
+            pass
         finally:
-            # Re-enable app buttons and hide loading overlays smoothly
-            submit_vid_btn.disabled = False
+            submit_vid_btn.disabled = False; loading_indicator.visible = False; page.update()
 
-            loading_indicator.visible = False
+    prompt = ft.TextField(hint_text="Describe video...", expand=True, border_radius=30, border_color="#1F242E",
+                          focused_border_color="#FFC107", bgcolor="#141722", content_padding=ft.Padding(20, 14, 20, 14))
+    video_player = ftv.Video(height=450, playlist=[], fill_color=ft.Colors.BLACK, aspect_ratio=16 / 9, autoplay=True,
+                             )
+    submit_vid_btn = ft.IconButton(ft.Icons.VIDEO_CALL, icon_color="#0F0F11", bgcolor="#FFC107", width=44, height=44,
+                                   on_click=generate_ltx_video)
 
-            page.update()
-
-    def download_vid(e):
-        global video_link
-
-        if not video_link or not os.path.exists(video_link):
-
-            print("No valid generated video file discovered to download yet.")
-
-            return
-
-        try:
-            # Map out path destination straight to your laptop system Downloads folder
-            downloads_folder = os.path.join(os.path.expanduser("~"), "Downloads")
-
-            save_path = os.path.join(downloads_folder, "yf_ltx_video.mp4")
-
-            # Since the file sits on your storage device already, copy it with zero internet drag
-            shutil.copy(video_link, save_path)
-
-            # Show a success alert banner down across the bottom viewport
-            page.snack_bar = ft.SnackBar(ft.Text(f"🚀 Video successfully saved to: {save_path}"), open=True)
-
-            page.update()
-
-        except Exception as ex:
-
-            print(f"An error occurred during file duplicate download layout: {ex}")
-
-    # ELEVATED BUTTONS FOR ACTIONS
-    submit_vid_btn = ft.ElevatedButton(
-        content=ft.Icon(ft.Icons.ARROW_UPWARD, color="yellow", size=22),
-        on_click=generate_ltx_video
-    )
-
-    download_vid_btn = ft.ElevatedButton(
-        content=ft.Icon(ft.Icons.DOWNLOAD_ROUNDED, color="yellow", size=22),
-        on_click=download_vid
-    )
-
+    # 1. Remove expand=True from the core player constructor
     video_player = ftv.Video(
-        expand=True,
-        playlist=[ftv.VideoMedia(video_link)] if video_link else [],
-        playlist_mode=ftv.PlaylistMode.LOOP,
+        playlist=[],
         fill_color=ft.Colors.BLACK,
         aspect_ratio=16 / 9,
         autoplay=True,
-        controls=True,
+        # expand=True REMOVED FROM HERE
     )
 
-    # ELEVATED BUTTONS FOR MEDIA
-    submit_gen_btn = ft.ElevatedButton(
-        content=ft.Icon(ft.Icons.ARROW_UPWARD, color="yellow", size=22),
-        on_click=run_image_generation
-    )
+    # 2. Keep expand=True on the parent pane, but wrap the player in ft.Expanded
+    video_pane = ft.Column([
+        ft.Row([
+            ft.Text("VIDEO SYNTHESIZER", size=11, weight=ft.FontWeight.BOLD, color="#6C7A89")
+        ], alignment=ft.MainAxisAlignment.CENTER),
+        ft.Divider(height=1, color="#1F232C"),
 
-    download_btn = ft.ElevatedButton(
-        content=ft.Icon(ft.Icons.DOWNLOAD_ROUNDED, color="yellow", size=22),
-        on_click=download_image
-    )
+        loading_indicator,
+        ft.Row([prompt, submit_vid_btn], vertical_alignment=ft.CrossAxisAlignment.CENTER)
+    ], expand=True, visible=False, spacing=20)  # KEEP expand=True here!
 
-    # 1. IMAGE GENERATION DIALOG (No Containers inside Controls Stack)
-    gen_dialog = ft.AlertDialog(
-        title=ft.Text("YF AI Image Creation", size=20, weight=ft.FontWeight.BOLD),
-        content=ft.Column(
-            controls=[
-                ft.Text("Create images using Hugging Face models.", size=12, color="grey400"),
-                ft.Divider(height=10, color="transparent"),
-                image_prompt_input,
-                submit_gen_btn,
-                loading_indicator,
-                ft.Divider(height=5, color="grey800"),
-                ft.Text("Output Preview Area", size=14, weight=ft.FontWeight.W_500),
-                ai_image_display,
-                ft.Divider(height=5, color="grey800"),
-                ft.Text("Download file", size=14, weight=ft.FontWeight.W_500),
-                download_btn,
-                ft.Divider(height=5, color="grey800"),
-                ft.Text("Image History", size=14, weight=ft.FontWeight.W_500),
-                history_grid
-            ],
-            tight=True,
-            spacing=15
-        ),
-        actions=[
-            ft.TextButton("Close Canvas", on_click=lambda e: setattr(gen_dialog, "open", False) or page.update())
-        ],
-        actions_alignment=ft.MainAxisAlignment.END,
-    )
-
-    # 2. VIDEO GENERATION DIALOG (No Containers inside Controls Stack)
-    gen_video_dialog = ft.AlertDialog(
-        title=ft.Text("YF AI Video Creation", size=20, weight=ft.FontWeight.BOLD),
-        content=ft.Column(
-            controls=[
-                ft.Text("Create videos using Hugging Face models.", size=12, color="grey400"),
-                ft.Divider(height=10, color="transparent"),
-                prompt,
-                submit_vid_btn,
-                loading_indicator,
-                ft.Divider(height=5, color="grey800"),
-                ft.Text("Output Preview Area", size=14, weight=ft.FontWeight.W_500),
-                video_player if video_link else ft.Text("No video generated yet. Type a prompt above and press upload!",
-                                                        color="grey500"),
-                ft.Divider(height=5, color="grey800"),
-                ft.Text("Download file", size=14, weight=ft.FontWeight.W_500),
-                download_vid_btn,
-            ],
-            tight=True,
-            spacing=15
-        ),
-        actions=[
-            ft.TextButton("Close Canvas", on_click=lambda e: setattr(gen_video_dialog, "open", False) or page.update())
-        ],
-        actions_alignment=ft.MainAxisAlignment.END,
-    )
-
-    # Store BOTH layout dialog configurations inside page overlays tree safely
-    page.overlay.append(gen_dialog)
-
-    page.overlay.append(gen_video_dialog)
-
-    def open_image_gen_page(e):
-        gen_dialog.open = True
-        page.update()
-
-    def open_vid_gen_page(e):
-        gen_video_dialog.open = True
-        page.update()
-
-    # NAVIGATION TRIGGERS (Positioned via Absolute Stack rules, Container Free)
-    image_generation = ft.ElevatedButton(
-        content=ft.Icon(ft.Icons.IMAGE_SEARCH, color=ft.Colors.BLUE_ACCENT_400, size=14),
-        top=10, right=90,
-        on_click=open_image_gen_page
-    )
-
-    video_generation = ft.ElevatedButton(
-        content=ft.Icon(ft.Icons.VIDEO_CALL, color=ft.Colors.PINK_ACCENT_400, size=14),
-        top=10, right=160,
-        on_click=open_vid_gen_page
-    )
     # =========================================================================
-    main_layout_stack = ft.Stack(
-        controls=[
-            app_content,
-            logo_image,
-            settings_btn,
-            image_generation,
-            video_generation
+    # SIDEBAR ROUTER (No Settings Modal)
+    # =========================================================================
+    def handle_nav_change(e):
+        idx = e.control.selected_index
+        chat_pane.visible = (idx == 0)
+        image_pane.visible = (idx == 1)
+        video_pane.visible = (idx == 2)
+        settings_dialog.visible = (idx == 3)
+        page.update()
+
+    sidebar = ft.NavigationRail(
+        selected_index=0, label_type=ft.NavigationRailLabelType.NONE, min_width=72, bgcolor="#111318",
+        destinations=[
+            ft.NavigationRailDestination(icon=ft.Icons.CHAT_BUBBLE_OUTLINE, selected_icon=ft.Icons.CHAT_BUBBLE),
+            ft.NavigationRailDestination(icon=ft.Icons.IMAGE_OUTLINED, selected_icon=ft.Icons.IMAGE),
+            ft.NavigationRailDestination(icon=ft.Icons.VIDEOCAM_OUTLINED, selected_icon=ft.Icons.VIDEOCAM),
+            ft.NavigationRailDestination(icon=ft.Icons.SETTINGS_OUTLINED, selected_icon=ft.Icons.SETTINGS, label="Settings"),
         ],
-        expand=True,
+        on_change=handle_nav_change
     )
+    master_workspace = ft.Row([
+        sidebar,
+        ft.VerticalDivider(width=1, color="#1F232C"),
+        ft.Stack([chat_pane, image_pane, video_pane, settings_dialog], expand=True)
+    ], expand=True)
 
-    page.add(main_layout_stack)
-
+    page.add(master_workspace)
 
 if __name__ == "__main__":
+
     ft.run(main, view=ft.AppView.WEB_BROWSER, port=8550)
